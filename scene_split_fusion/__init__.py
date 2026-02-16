@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,12 +17,39 @@ class Boundary:
     trans_score: float = 0.0
 
 
+def _resolve_bin(name: str) -> str:
+    # 1) explicit env override
+    env_key = name.upper() + "_PATH"
+    env_val = os.environ.get(env_key, "").strip()
+    if env_val and Path(env_val).exists():
+        return env_val
+
+    # 2) PATH lookup
+    found = shutil.which(name)
+    if found:
+        return found
+
+    # 3) common macOS Homebrew/system locations
+    candidates = [
+        f"/opt/homebrew/bin/{name}",
+        f"/usr/local/bin/{name}",
+        f"/usr/bin/{name}",
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            return c
+
+    # keep original behavior (will raise FileNotFoundError at execution)
+    return name
+
+
 def probe_fps(video_path: str) -> float:
     """
     ffprobe로 fps 가져오기. (TransNetV2 frames length -> time 변환에 필요)
     """
+    ffprobe_bin = _resolve_bin("ffprobe")
     cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        ffprobe_bin, "-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=r_frame_rate", "-of", "default=nokey=1:noprint_wrappers=1",
         video_path
     ]
@@ -53,8 +81,9 @@ def run_camera_jump(*args, **kwargs):
 
 
 def probe_duration(video_path: str) -> float:
+    ffprobe_bin = _resolve_bin("ffprobe")
     cmd = [
-        "ffprobe", "-v", "error",
+        ffprobe_bin, "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=nokey=1:noprint_wrappers=1",
         video_path

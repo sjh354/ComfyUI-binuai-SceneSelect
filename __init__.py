@@ -839,6 +839,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SceneSelectorKling": "Scene Selector (Kling Best Scene)",
+    "SceneSelectorKling": "Scene Selector (Without Upload)",
     "SceneSelectorUpload": "Scene Selector (Upload)",
 }
