@@ -11,6 +11,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+try:
+    import folder_paths
+except Exception:
+    folder_paths = None
 
 
 def _ensure_local_pkg_on_path() -> Path:
@@ -116,9 +120,20 @@ def _load_audio_from_video(video_path: str):
 class SceneSelectorKling:
     @classmethod
     def INPUT_TYPES(cls):
+        files = []
+        if folder_paths is not None:
+            input_dir = folder_paths.get_input_directory()
+            for f in os.listdir(input_dir):
+                fp = os.path.join(input_dir, f)
+                if not os.path.isfile(fp):
+                    continue
+                parts = f.rsplit(".", 1)
+                if len(parts) == 2 and parts[1].lower() in {"webm", "mp4", "mkv", "gif", "mov"}:
+                    files.append(f)
+
         return {
             "required": {
-                "video_path": ("STRING", {"default": ""}),
+                "video": (sorted(files),) if files else ("STRING", {"default": ""}),
                 "workers": ("INT", {"default": 4, "min": 1, "max": 16}),
                 "max_output_frames": ("INT", {"default": 96, "min": 1, "max": 600}),
                 "depth_model": ("STRING", {"default": "LiheYoung/depth-anything-small-hf"}),
@@ -139,7 +154,7 @@ class SceneSelectorKling:
 
     def run(
         self,
-        video_path,
+        video,
         workers,
         max_output_frames,
         depth_model,
@@ -151,7 +166,10 @@ class SceneSelectorKling:
         local_files_only,
         cache_dir,
     ):
-        video_path = str(video_path).strip()
+        if folder_paths is not None and isinstance(video, str):
+            video_path = folder_paths.get_annotated_filepath(video.strip())
+        else:
+            video_path = str(video).strip()
         if not video_path or not os.path.isfile(video_path):
             raise ValueError(f"video_path not found: {video_path}")
 
