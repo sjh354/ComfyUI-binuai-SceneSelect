@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -617,8 +618,8 @@ class SceneSelectorUpload(SceneSelectorKling):
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "INT")
-    RETURN_NAMES = ("IMAGE", "fps_estimate")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "INT")
+    RETURN_NAMES = ("IMAGE", "audio", "fps_estimate")
     FUNCTION = "run"
     CATEGORY = "video/scenedetect"
 
@@ -687,6 +688,50 @@ class SceneSelectorUpload(SceneSelectorKling):
             return torch.zeros((1, 64, 64, 3), dtype=torch.float32)
         return torch.stack(frames, dim=0).to(dtype=torch.float32)
 
+    def _read_audio_segment(
+        self,
+        video_path: Path,
+        start_sec: float,
+        end_sec: float,
+        sample_rate: int = 44100,
+    ):
+        start_sec = max(0.0, float(start_sec))
+        end_sec = max(start_sec + 1e-3, float(end_sec))
+        cmd = [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-ss",
+            f"{start_sec:.6f}",
+            "-to",
+            f"{end_sec:.6f}",
+            "-i",
+            str(video_path),
+            "-vn",
+            "-ac",
+            "2",
+            "-ar",
+            str(int(sample_rate)),
+            "-f",
+            "f32le",
+            "pipe:1",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, check=False)
+        raw = proc.stdout if proc.returncode == 0 else b""
+        if not raw:
+            waveform = torch.zeros((1, 2, 1), dtype=torch.float32)
+            return {"waveform": waveform.contiguous(), "sample_rate": int(sample_rate)}
+
+        audio_np = np.frombuffer(raw, dtype=np.float32)
+        if audio_np.size < 2:
+            waveform = torch.zeros((1, 2, 1), dtype=torch.float32)
+            return {"waveform": waveform.contiguous(), "sample_rate": int(sample_rate)}
+
+        n = (audio_np.size // 2) * 2
+        audio_np = audio_np[:n].reshape(-1, 2)  # [T, C]
+        waveform = torch.from_numpy(audio_np.T.copy()).unsqueeze(0).to(dtype=torch.float32)  # [1, C, T]
+        return {"waveform": waveform.contiguous(), "sample_rate": int(sample_rate)}
+
     def run(
         self,
         video,
@@ -745,6 +790,8 @@ class SceneSelectorUpload(SceneSelectorKling):
 
         best_score = -1.0
         best_images = None
+        best_start_sec = 0.0
+        best_end_sec = 0.0
         for start_sec, end_sec in scenes:
             scene_images = self._read_scene_tensor(
                 video_path=resolved,
@@ -769,11 +816,21 @@ class SceneSelectorUpload(SceneSelectorKling):
             if score > best_score:
                 best_score = float(score)
                 best_images = scene_images
+                best_start_sec = float(start_sec)
+                best_end_sec = float(end_sec)
 
         if best_images is None:
             best_images = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            best_start_sec = 0.0
+            best_end_sec = max(0.1, float(total_frames) / float(fps) if total_frames > 0 else 0.1)
 
-        return (best_images, fps_estimate)
+        out_audio = self._read_audio_segment(
+            video_path=resolved,
+            start_sec=best_start_sec,
+            end_sec=best_end_sec,
+            sample_rate=44100,
+        )
+        return (best_images, out_audio, fps_estimate)
 
 
 NODE_CLASS_MAPPINGS = {
