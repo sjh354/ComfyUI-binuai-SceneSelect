@@ -139,6 +139,10 @@ class SceneSelectorKling:
             sl[time_dim] = slice(start_idx, end_idx)
             y = x[tuple(sl)]
 
+        # Comfy video save path expects C-contiguous numpy conversion.
+        # Ensure contiguous tensor layout before returning AUDIO waveform.
+        if isinstance(y, torch.Tensor):
+            y = y.contiguous()
         out_audio = {"waveform": y, "sample_rate": sample_rate}
         return out_audio
 
