@@ -1,0 +1,9 @@
+# Runtime deps used directly by this custom node package.
+numpy>=1.26.0,<3
+opencv-python>=4.8.0,<5
+torch>=2.2.0,<3
+transformers>=4.40.0,<5
+ultralytics>=8.2.0,<9
+
+# System dependency (not a pip package):
+# ffmpeg
