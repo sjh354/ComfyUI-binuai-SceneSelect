@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -53,6 +54,152 @@ YOLO_MODEL_PRESETS = [
     "yolo11x-seg.pt",
 ]
 
+SAM3_CHECKPOINT_URL = "https://huggingface.co/facebook/sam3/resolve/main/sam3.pt"
+
+
+class _SAM3ModelWrapper:
+    """Best-effort SAM3 wrapper exposing predict()/__call__ for downstream nodes."""
+
+    def __init__(self, checkpoint_path: str, device: str = "auto"):
+        self.checkpoint_path = str(checkpoint_path)
+        self.device = str(device)
+        self.backend = None
+        self.predictor = None
+        self.init_error = ""
+        self._init_predictor()
+
+    def _init_predictor(self) -> None:
+        # Keep this loader robust even if sam3 runtime package is unavailable.
+        try:
+            import importlib
+
+            sam3_mod = importlib.import_module("sam3")
+        except Exception as exc:
+            self.init_error = f"sam3 package import failed: {exc}"
+            return
+
+        candidates = [
+            ("build_sam3_text_predictor", {"checkpoint": self.checkpoint_path, "device": self.device}),
+            ("build_predictor", {"checkpoint": self.checkpoint_path, "device": self.device}),
+            ("SAM3TextPredictor", {"checkpoint": self.checkpoint_path, "device": self.device}),
+            ("SAM3Predictor", {"checkpoint": self.checkpoint_path, "device": self.device}),
+            ("SAM3", {"checkpoint": self.checkpoint_path, "device": self.device}),
+        ]
+
+        for name, kwargs in candidates:
+            ctor = getattr(sam3_mod, name, None)
+            if not callable(ctor):
+                continue
+            try:
+                self.predictor = ctor(**kwargs)
+                self.backend = name
+                self.init_error = ""
+                return
+            except Exception:
+                continue
+
+        self.init_error = "No compatible SAM3 predictor builder found in installed sam3 package."
+
+    def _infer(self, image, prompt: str):
+        if self.predictor is None:
+            raise RuntimeError(
+                "SAM3 predictor is not initialized. "
+                f"checkpoint={self.checkpoint_path} device={self.device} reason={self.init_error}"
+            )
+
+        call_patterns = [
+            lambda fn: fn(image=image, text_prompt=prompt),
+            lambda fn: fn(image=image, prompt=prompt),
+            lambda fn: fn(image=image, text=prompt),
+            lambda fn: fn(image, prompt),
+        ]
+
+        methods = []
+        if callable(self.predictor):
+            methods.append(self.predictor)
+        for name in ("predict", "segment", "infer", "__call__"):
+            m = getattr(self.predictor, name, None)
+            if callable(m):
+                methods.append(m)
+
+        last_err = None
+        for method in methods:
+            for pattern in call_patterns:
+                try:
+                    return pattern(method)
+                except Exception as exc:
+                    last_err = exc
+                    continue
+
+        raise RuntimeError(f"SAM3 inference call failed for all patterns: {last_err}")
+
+    def predict(self, image=None, prompt: str = "", text_prompt: str = "", text: str = ""):
+        q = str(text_prompt or prompt or text or "").strip()
+        return self._infer(image=image, prompt=q)
+
+    def __call__(self, image=None, prompt: str = "", text_prompt: str = "", text: str = ""):
+        q = str(text_prompt or prompt or text or "").strip()
+        return self._infer(image=image, prompt=q)
+
+
+class SAM3ModelLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "device": (["auto", "cpu", "cuda", "mps"],),
+                "force_download": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("SAM2_MODEL", "STRING")
+    RETURN_NAMES = ("sam2_model", "checkpoint_path")
+    FUNCTION = "run"
+    CATEGORY = "video/scenedetect"
+
+    def _model_dir(self) -> Path:
+        if folder_paths is not None:
+            try:
+                return Path(folder_paths.models_dir) / "sam3"
+            except Exception:
+                pass
+        return Path.cwd() / "models" / "sam3"
+
+    def _download_checkpoint(self, model_dir: Path, force_download: bool) -> Path:
+        model_dir.mkdir(parents=True, exist_ok=True)
+        out_path = model_dir / "sam3.pt"
+        if out_path.exists() and not force_download:
+            return out_path
+
+        # 1) Try huggingface_hub first (handles token auth for gated models).
+        try:
+            from huggingface_hub import hf_hub_download
+
+            downloaded = hf_hub_download(
+                repo_id="facebook/sam3",
+                filename="sam3.pt",
+                local_dir=str(model_dir),
+                local_dir_use_symlinks=False,
+            )
+            return Path(downloaded)
+        except Exception:
+            pass
+
+        # 2) Fallback to direct URL download.
+        urllib.request.urlretrieve(SAM3_CHECKPOINT_URL, str(out_path))
+        return out_path
+
+    def run(self, device, force_download):
+        ckpt_path = self._download_checkpoint(self._model_dir(), bool(force_download))
+        wrapped = _SAM3ModelWrapper(checkpoint_path=str(ckpt_path), device=str(device))
+        sam2_model_payload = {
+            "model": wrapped,
+            "checkpoint_path": str(ckpt_path),
+            "model_type": "sam3",
+            "checkpoint_url": SAM3_CHECKPOINT_URL,
+        }
+        return (sam2_model_payload, str(ckpt_path))
+
 
 class SceneSelectorKling:
     @classmethod
@@ -66,7 +213,7 @@ class SceneSelectorKling:
                 "min_scene_len_frames": ("INT", {"default": 8, "min": 1, "max": 1000}),
                 "depth_model": (DEPTH_MODEL_PRESETS,),
                 "depth_device": (["auto", "cpu", "cuda", "mps"],),
-                "yolo_model": ("STRING", {"default": "yolov8m-seg.pt"}),
+                "yolo_model": (YOLO_MODEL_PRESETS,),
                 "yolo_conf": ("FLOAT", {"default": 0.35, "min": 0.01, "max": 1.0, "step": 0.01}),
                 "yolo_imgsz": ("INT", {"default": 640, "min": 256, "max": 2048}),
                 "sample_fps": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 30.0, "step": 0.1}),
@@ -1367,12 +1514,14 @@ class SceneSelectorSAM(SceneSelectorUpload):
 
 
 NODE_CLASS_MAPPINGS = {
+    "SAM3ModelLoader": SAM3ModelLoader,
     "SceneSelectorKling": SceneSelectorKling,
     "SceneSelectorUpload": SceneSelectorUpload,
     "SceneSelectorSAM": SceneSelectorSAM,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "SAM3ModelLoader": "SAM3 Model Loader",
     "SceneSelectorKling": "Scene Selector (Without Upload)",
     "SceneSelectorUpload": "Scene Selector (Upload)",
     "SceneSelectorSAM": "Scene Selector (SAM)",
