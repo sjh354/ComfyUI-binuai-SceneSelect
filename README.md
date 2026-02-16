@@ -10,7 +10,7 @@ git clone https://github.com/sjh354/ComfyUI-binuai-SceneSelect.git
 cd ComfyUI-binuai-SceneSelect
 python3 -m pip install -r requirements.txt
 
-sudo apt-get update && sudo apt-get install -y ffmpeg
+apt-get update && apt-get install -y ffmpeg
 ```
 
 ## TODO
