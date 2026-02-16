@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -25,6 +26,34 @@ def _ensure_local_pkg_on_path() -> None:
 _ensure_local_pkg_on_path()
 
 
+DEPTH_MODEL_PRESETS = [
+    "LiheYoung/depth-anything-small-hf",
+    "LiheYoung/depth-anything-base-hf",
+    "LiheYoung/depth-anything-large-hf",
+    "depth-anything/Depth-Anything-V2-Small-hf",
+    "depth-anything/Depth-Anything-V2-Base-hf",
+    "depth-anything/Depth-Anything-V2-Large-hf",
+]
+
+YOLO_MODEL_PRESETS = [
+    "yolov8m-seg.pt",
+    "yolov8n.pt",
+    "yolov8s.pt",
+    "yolov8m.pt",
+    "yolov8l.pt",
+    "yolov8x.pt",
+    "yolov8n-seg.pt",
+    "yolov8s-seg.pt",
+    "yolov8l-seg.pt",
+    "yolov8x-seg.pt",
+    "yolo11m.pt",
+    "yolo11l.pt",
+    "yolo11x.pt",
+    "yolo11l-seg.pt",
+    "yolo11x-seg.pt",
+]
+
+
 class SceneSelectorKling:
     @classmethod
     def INPUT_TYPES(cls):
@@ -35,7 +64,7 @@ class SceneSelectorKling:
                 "video_info": ("VHS_VIDEOINFO", {"forceInput": True}),
                 "cut_threshold": ("FLOAT", {"default": 0.12, "min": 0.001, "max": 1.0, "step": 0.001}),
                 "min_scene_len_frames": ("INT", {"default": 8, "min": 1, "max": 1000}),
-                "depth_model": ("STRING", {"default": "LiheYoung/depth-anything-small-hf"}),
+                "depth_model": (DEPTH_MODEL_PRESETS,),
                 "depth_device": (["auto", "cpu", "cuda", "mps"],),
                 "yolo_model": ("STRING", {"default": "yolov8m-seg.pt"}),
                 "yolo_conf": ("FLOAT", {"default": 0.35, "min": 0.01, "max": 1.0, "step": 0.01}),
@@ -54,10 +83,52 @@ class SceneSelectorKling:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "INT")
-    RETURN_NAMES = ("IMAGE", "audio", "fps_estimate")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "STRING")
+    RETURN_NAMES = ("IMAGE", "audio", "fps_estimate", "analysis_json")
     FUNCTION = "run"
     CATEGORY = "video/scenedetect"
+
+    @staticmethod
+    def _json_default(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, torch.Tensor):
+            return {
+                "type": "tensor",
+                "shape": list(obj.shape),
+                "dtype": str(obj.dtype),
+            }
+        return str(obj)
+
+    def _to_json(self, payload: dict) -> str:
+        return json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default)
+
+    @staticmethod
+    def _normalize_choice(value, choices: list[str], fallback: str) -> str:
+        s = str(value).strip()
+        if s in choices:
+            return s
+        if fallback in choices:
+            return fallback
+        return choices[0] if choices else s
+
+    @staticmethod
+    def _audio_meta(audio) -> dict:
+        if not isinstance(audio, Mapping):
+            return {"type": str(type(audio))}
+        waveform = audio.get("waveform")
+        sample_rate = audio.get("sample_rate")
+        out = {"sample_rate": int(sample_rate) if sample_rate is not None else None}
+        if isinstance(waveform, torch.Tensor):
+            out["waveform_shape"] = list(waveform.shape)
+            out["waveform_dtype"] = str(waveform.dtype)
+        else:
+            out["waveform_type"] = str(type(waveform))
+        return out
 
     def _detect_scenes_from_images(
         self,
@@ -328,7 +399,7 @@ class SceneSelectorKling:
         sam2_prompt: str = "floor",
         sam2_min_mask_ratio: float = 0.01,
         sam2_max_mask_ratio: float = 0.95,
-    ) -> float:
+    ) -> dict:
         from video_analysis_utils.kling_metrics import (
             CameraMotionMetric,
             DepthVarianceMetric,
@@ -344,7 +415,7 @@ class SceneSelectorKling:
         dynamic_class_ids = {0, 1, 2, 3, 5, 7, 16, 17, 18, 19, 21, 22, 23, 24}
         n = int(scene_images.shape[0])
         if n == 0:
-            return 0.0
+            return {"score": 0.0, "reason": "empty_scene_images"}
 
         step = max(1, int(round(float(fps) / max(float(sample_fps), 0.1))))
         sample_ids = list(range(0, n, step))
@@ -359,6 +430,14 @@ class SceneSelectorKling:
         lighting_metric = LightingStabilityMetric()
         plane_tracks = []
         residual_thresholds = []
+        floor_ratios = []
+        dynamic_ratios = []
+        motion_values = []
+        sam2_used_count = 0
+        sam2_fallback_count = 0
+        sam2_empty_or_error_count = 0
+        sam2_ratio_reject_count = 0
+        frame_debug = []
 
         prev_gray = None
         sampled = 0
@@ -375,6 +454,7 @@ class SceneSelectorKling:
                 params = estimate_pair_transform(prev_gray, gray)
                 if params is not None:
                     motion_signal = pair_motion_signal(params, width=w, height=h)
+                    motion_values.append(float(motion_signal))
             prev_gray = gray
 
             depth = depth_estimator.predict_depth(frame_bgr)
@@ -383,6 +463,7 @@ class SceneSelectorKling:
             residual_thresholds.append(residual_thr)
 
             floor_mask = None
+            floor_source = "depth_fallback"
             if sam2_model is not None:
                 floor_mask = self._infer_floor_mask_with_sam2(
                     sam2_model=sam2_model,
@@ -393,11 +474,23 @@ class SceneSelectorKling:
                     ratio = float(floor_mask.mean())
                     if ratio < float(sam2_min_mask_ratio) or ratio > float(sam2_max_mask_ratio):
                         floor_mask = None
+                        sam2_ratio_reject_count += 1
+                    else:
+                        floor_source = "sam2"
+                        sam2_used_count += 1
+                else:
+                    sam2_empty_or_error_count += 1
             if floor_mask is None:
                 floor_mask = compute_floor_mask(depth=depth, invert_depth=bool(invert_depth))
+                if sam2_model is not None:
+                    sam2_fallback_count += 1
             yolo_results = yolo_model.predict(frame_bgr, conf=float(yolo_conf), imgsz=int(yolo_imgsz), verbose=False)
             yolo_result = yolo_results[0]
             dynamic_mask = self._extract_dynamic_mask_local(yolo_result, frame_shape=(h, w), dynamic_class_ids=dynamic_class_ids)
+            floor_ratio = float(floor_mask.mean()) if floor_mask.size else 0.0
+            dynamic_ratio = float(dynamic_mask.mean()) if dynamic_mask.size else 0.0
+            floor_ratios.append(floor_ratio)
+            dynamic_ratios.append(dynamic_ratio)
 
             ctx = FrameContext(
                 frame_bgr=frame_bgr,
@@ -413,27 +506,96 @@ class SceneSelectorKling:
             flatness_metric.update(ctx)
             lighting_metric.update(ctx)
             sampled += 1
+            if len(frame_debug) < 48:
+                frame_debug.append(
+                    {
+                        "scene_frame_index": int(sid),
+                        "floor_source": floor_source,
+                        "floor_ratio": floor_ratio,
+                        "dynamic_ratio": dynamic_ratio,
+                        "motion_signal": float(motion_signal) if motion_signal is not None else None,
+                        "residual_threshold": float(residual_thr),
+                    }
+                )
 
         if sampled == 0:
-            return 0.0
+            return {"score": 0.0, "reason": "no_sampled_frames"}
 
         global_residual_thr = float(sum(residual_thresholds) / len(residual_thresholds)) if residual_thresholds else 0.02
-        _, plane_score = compute_plane_metrics(plane_tracks, residual_threshold=global_residual_thr)
+        plane_count, plane_score = compute_plane_metrics(plane_tracks, residual_threshold=global_residual_thr)
         camera_out = camera_metric.finalize()
         texture_out = texture_metric.finalize()
         occlusion_out = occlusion_metric.finalize()
         flatness_out = flatness_metric.finalize()
         lighting_out = lighting_metric.finalize()
 
-        score = (
-            float(weights.w1_plane) * float(plane_score)
-            + float(weights.w2_camera_motion) * float(camera_out["camera_motion_score"])
-            + float(weights.w3_occlusion) * float(occlusion_out["occlusion_score"])
-            + float(weights.w4_flatness) * float(flatness_out["flatness_score"])
-            + float(weights.w5_lighting) * float(lighting_out["lighting_stability"])
-            + float(weights.w6_texture) * float(texture_out["texture_score"])
-        )
-        return float(np.clip(score, 0.0, 1.0))
+        comp_plane = float(weights.w1_plane) * float(plane_score)
+        comp_camera = float(weights.w2_camera_motion) * float(camera_out["camera_motion_score"])
+        comp_occlusion = float(weights.w3_occlusion) * float(occlusion_out["occlusion_score"])
+        comp_flatness = float(weights.w4_flatness) * float(flatness_out["flatness_score"])
+        comp_lighting = float(weights.w5_lighting) * float(lighting_out["lighting_stability"])
+        comp_texture = float(weights.w6_texture) * float(texture_out["texture_score"])
+        score = float(np.clip(comp_plane + comp_camera + comp_occlusion + comp_flatness + comp_lighting + comp_texture, 0.0, 1.0))
+
+        return {
+            "score": score,
+            "sampled_frames": int(sampled),
+            "scene_total_frames": int(n),
+            "sampling_step": int(step),
+            "sampled_frame_indices": [int(x) for x in sample_ids],
+            "weights": {
+                "w1_plane": float(weights.w1_plane),
+                "w2_camera_motion": float(weights.w2_camera_motion),
+                "w3_occlusion": float(weights.w3_occlusion),
+                "w4_flatness": float(weights.w4_flatness),
+                "w5_lighting": float(weights.w5_lighting),
+                "w6_texture": float(weights.w6_texture),
+            },
+            "components": {
+                "plane_component": comp_plane,
+                "camera_motion_component": comp_camera,
+                "occlusion_component": comp_occlusion,
+                "flatness_component": comp_flatness,
+                "lighting_component": comp_lighting,
+                "texture_component": comp_texture,
+            },
+            "metrics": {
+                "plane_count": int(plane_count),
+                "plane_score": float(plane_score),
+                "global_residual_threshold": float(global_residual_thr),
+                "camera_motion": camera_out,
+                "texture": texture_out,
+                "occlusion": occlusion_out,
+                "flatness": flatness_out,
+                "lighting": lighting_out,
+            },
+            "mask_stats": {
+                "floor_ratio_mean": float(np.mean(floor_ratios)) if floor_ratios else 0.0,
+                "floor_ratio_min": float(np.min(floor_ratios)) if floor_ratios else 0.0,
+                "floor_ratio_max": float(np.max(floor_ratios)) if floor_ratios else 0.0,
+                "dynamic_ratio_mean": float(np.mean(dynamic_ratios)) if dynamic_ratios else 0.0,
+                "dynamic_ratio_min": float(np.min(dynamic_ratios)) if dynamic_ratios else 0.0,
+                "dynamic_ratio_max": float(np.max(dynamic_ratios)) if dynamic_ratios else 0.0,
+            },
+            "sam2_stats": {
+                "sam2_enabled": bool(sam2_model is not None),
+                "sam2_used_count": int(sam2_used_count),
+                "sam2_fallback_count": int(sam2_fallback_count),
+                "sam2_empty_or_error_count": int(sam2_empty_or_error_count),
+                "sam2_ratio_reject_count": int(sam2_ratio_reject_count),
+                "sam2_prompt": str(sam2_prompt),
+                "sam2_min_mask_ratio": float(sam2_min_mask_ratio),
+                "sam2_max_mask_ratio": float(sam2_max_mask_ratio),
+            },
+            "motion_signal_stats": {
+                "count": int(len(motion_values)),
+                "mean": float(np.mean(motion_values)) if motion_values else 0.0,
+                "std": float(np.std(motion_values)) if motion_values else 0.0,
+                "min": float(np.min(motion_values)) if motion_values else 0.0,
+                "max": float(np.max(motion_values)) if motion_values else 0.0,
+            },
+            "frame_debug_samples": frame_debug,
+        }
 
     def run(
         self,
@@ -483,7 +645,15 @@ class SceneSelectorKling:
         total = int(images.shape[0])
         if total <= 0:
             dummy = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (dummy, audio, 24)
+            meta_json = self._to_json(
+                {
+                    "node": "SceneSelectorKling",
+                    "status": "empty_input_images",
+                    "fps_estimate": 24,
+                    "input_audio_meta": self._audio_meta(audio),
+                }
+            )
+            return (dummy, audio, 24, meta_json)
 
         fps = 24.0
         if isinstance(video_info, dict):
@@ -497,13 +667,24 @@ class SceneSelectorKling:
             min_scene_len_frames=int(min_scene_len_frames),
         )
 
+        selected_depth_model = self._normalize_choice(
+            value=depth_model,
+            choices=DEPTH_MODEL_PRESETS,
+            fallback="LiheYoung/depth-anything-small-hf",
+        )
+        selected_yolo_model = self._normalize_choice(
+            value=yolo_model,
+            choices=YOLO_MODEL_PRESETS,
+            fallback="yolov8m-seg.pt",
+        )
+
         depth_estimator = DepthEstimator(
-            model_name=str(depth_model),
+            model_name=selected_depth_model,
             device=str(depth_device),
             local_files_only=bool(local_files_only),
             cache_dir=str(cache_dir).strip() if str(cache_dir).strip() else None,
         )
-        yolo = YOLO(str(yolo_model))
+        yolo = YOLO(selected_yolo_model)
         weights = KlingWeights(
             w1_plane=float(w1_plane),
             w2_camera_motion=float(w2_camera_motion),
@@ -516,7 +697,7 @@ class SceneSelectorKling:
         scene_scores = []
         for idx, (start, end) in enumerate(scenes, start=1):
             chunk = images[start:end]
-            score = self._score_scene_kling(
+            score_meta = self._score_scene_kling(
                 scene_images=chunk,
                 fps=fps,
                 depth_estimator=depth_estimator,
@@ -528,12 +709,14 @@ class SceneSelectorKling:
                 yolo_imgsz=int(yolo_imgsz),
                 weights=weights,
             )
+            score = float(score_meta.get("score", 0.0))
             scene_scores.append(
                 {
                     "scene_index": int(idx),
                     "start_frame": int(start),
                     "end_frame_exclusive": int(end),
                     "kling_stability": float(score),
+                    "analysis": score_meta,
                 }
             )
 
@@ -555,8 +738,58 @@ class SceneSelectorKling:
                 f"end_frame_exclusive={e}",
             )
             out_audio = self._slice_audio_by_time(audio, start_sec=start_sec, end_sec=end_sec)
-
-        return (out_images, out_audio, fps_estimate)
+        analysis_json = self._to_json(
+            {
+                "node": "SceneSelectorKling",
+                "input": {
+                    "total_frames": int(total),
+                    "fps": float(fps),
+                    "fps_estimate": int(fps_estimate),
+                    "video_info": dict(video_info) if isinstance(video_info, Mapping) else str(type(video_info)),
+                    "audio_meta": self._audio_meta(audio),
+                },
+                "params": {
+                    "cut_threshold": float(cut_threshold),
+                    "min_scene_len_frames": int(min_scene_len_frames),
+                    "depth_model": selected_depth_model,
+                    "depth_device": str(depth_device),
+                    "yolo_model": selected_yolo_model,
+                    "yolo_conf": float(yolo_conf),
+                    "yolo_imgsz": int(yolo_imgsz),
+                    "sample_fps": float(sample_fps),
+                    "max_frames": int(max_frames),
+                    "invert_depth": bool(invert_depth),
+                    "local_files_only": bool(local_files_only),
+                    "cache_dir": str(cache_dir).strip(),
+                },
+                "weights": {
+                    "w1_plane": float(w1_plane),
+                    "w2_camera_motion": float(w2_camera_motion),
+                    "w3_occlusion": float(w3_occlusion),
+                    "w4_flatness": float(w4_flatness),
+                    "w5_lighting": float(w5_lighting),
+                    "w6_texture": float(w6_texture),
+                },
+                "scene_ranges": [
+                    {
+                        "scene_index": i + 1,
+                        "start_frame": int(s0),
+                        "end_frame_exclusive": int(e0),
+                        "frame_count": int(max(0, e0 - s0)),
+                        "start_sec": float(s0 / fps),
+                        "end_sec": float(e0 / fps),
+                    }
+                    for i, (s0, e0) in enumerate(scenes)
+                ],
+                "scene_scores": scene_scores,
+                "best_scene": best if best is not None else None,
+                "selected_output": {
+                    "selected_frame_count": int(out_images.shape[0]),
+                    "selected_audio_meta": self._audio_meta(out_audio),
+                },
+            }
+        )
+        return (out_images, out_audio, fps_estimate, analysis_json)
 
 
 class SceneSelectorUpload(SceneSelectorKling):
@@ -595,9 +828,9 @@ class SceneSelectorUpload(SceneSelectorKling):
                         "vhs_path_extensions": ["mp4", "mov", "mkv", "webm", "avi", "m4v"],
                     },
                 ),
-                "depth_model": ("STRING", {"default": "LiheYoung/depth-anything-small-hf"}),
+                "depth_model": (DEPTH_MODEL_PRESETS,),
                 "depth_device": (["auto", "cpu", "cuda", "mps"],),
-                "yolo_model": ("STRING", {"default": "yolov8m-seg.pt"}),
+                "yolo_model": (YOLO_MODEL_PRESETS,),
                 "yolo_conf": ("FLOAT", {"default": 0.35, "min": 0.01, "max": 1.0, "step": 0.01}),
                 "yolo_imgsz": ("INT", {"default": 640, "min": 256, "max": 2048}),
                 "sample_fps": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 30.0, "step": 0.1}),
@@ -618,8 +851,8 @@ class SceneSelectorUpload(SceneSelectorKling):
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "INT")
-    RETURN_NAMES = ("IMAGE", "audio", "fps_estimate")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "STRING")
+    RETURN_NAMES = ("IMAGE", "audio", "fps_estimate", "analysis_json")
     FUNCTION = "run"
     CATEGORY = "video/scenedetect"
 
@@ -772,13 +1005,24 @@ class SceneSelectorUpload(SceneSelectorKling):
             duration = float(total_frames) / float(fps) if total_frames > 0 else 0.0
             scenes = [(0.0, max(duration, 0.1))]
 
+        selected_depth_model = self._normalize_choice(
+            value=depth_model,
+            choices=DEPTH_MODEL_PRESETS,
+            fallback="LiheYoung/depth-anything-small-hf",
+        )
+        selected_yolo_model = self._normalize_choice(
+            value=yolo_model,
+            choices=YOLO_MODEL_PRESETS,
+            fallback="yolov8m-seg.pt",
+        )
+
         depth_estimator = DepthEstimator(
-            model_name=str(depth_model),
+            model_name=selected_depth_model,
             device=str(depth_device),
             local_files_only=bool(local_files_only),
             cache_dir=str(cache_dir).strip() if str(cache_dir).strip() else None,
         )
-        yolo = YOLO(str(yolo_model))
+        yolo = YOLO(selected_yolo_model)
         weights = KlingWeights(
             w1_plane=float(w1_plane),
             w2_camera_motion=float(w2_camera_motion),
@@ -792,6 +1036,7 @@ class SceneSelectorUpload(SceneSelectorKling):
         best_images = None
         best_start_sec = 0.0
         best_end_sec = 0.0
+        scene_scores = []
         for start_sec, end_sec in scenes:
             scene_images = self._read_scene_tensor(
                 video_path=resolved,
@@ -801,7 +1046,7 @@ class SceneSelectorUpload(SceneSelectorKling):
                 total_frames=total_frames,
                 max_decode_frames_per_scene=int(max_decode_frames_per_scene),
             )
-            score = self._score_scene_kling(
+            score_meta = self._score_scene_kling(
                 scene_images=scene_images,
                 fps=fps,
                 depth_estimator=depth_estimator,
@@ -812,6 +1057,16 @@ class SceneSelectorUpload(SceneSelectorKling):
                 yolo_conf=float(yolo_conf),
                 yolo_imgsz=int(yolo_imgsz),
                 weights=weights,
+            )
+            score = float(score_meta.get("score", 0.0))
+            scene_scores.append(
+                {
+                    "start_sec": float(start_sec),
+                    "end_sec": float(end_sec),
+                    "decoded_frame_count": int(scene_images.shape[0]),
+                    "kling_stability": float(score),
+                    "analysis": score_meta,
+                }
             )
             if score > best_score:
                 best_score = float(score)
@@ -830,7 +1085,57 @@ class SceneSelectorUpload(SceneSelectorKling):
             end_sec=best_end_sec,
             sample_rate=44100,
         )
-        return (best_images, out_audio, fps_estimate)
+        analysis_json = self._to_json(
+            {
+                "node": "SceneSelectorUpload",
+                "input": {
+                    "video": str(video),
+                    "video_path_override": str(video_path),
+                    "resolved_video_path": str(resolved),
+                    "source_fps": float(fps),
+                    "source_total_frames": int(total_frames),
+                    "fps_estimate": int(fps_estimate),
+                },
+                "params": {
+                    "depth_model": selected_depth_model,
+                    "depth_device": str(depth_device),
+                    "yolo_model": selected_yolo_model,
+                    "yolo_conf": float(yolo_conf),
+                    "yolo_imgsz": int(yolo_imgsz),
+                    "sample_fps": float(sample_fps),
+                    "max_frames": int(max_frames),
+                    "max_decode_frames_per_scene": int(max_decode_frames_per_scene),
+                    "invert_depth": bool(invert_depth),
+                    "local_files_only": bool(local_files_only),
+                    "cache_dir": str(cache_dir).strip(),
+                },
+                "weights": {
+                    "w1_plane": float(w1_plane),
+                    "w2_camera_motion": float(w2_camera_motion),
+                    "w3_occlusion": float(w3_occlusion),
+                    "w4_flatness": float(w4_flatness),
+                    "w5_lighting": float(w5_lighting),
+                    "w6_texture": float(w6_texture),
+                },
+                "scenes": [
+                    {
+                        "scene_index": i + 1,
+                        "start_sec": float(s0),
+                        "end_sec": float(e0),
+                    }
+                    for i, (s0, e0) in enumerate(scenes)
+                ],
+                "scene_scores": scene_scores,
+                "best_scene": {
+                    "score": float(best_score),
+                    "start_sec": float(best_start_sec),
+                    "end_sec": float(best_end_sec),
+                    "selected_frame_count": int(best_images.shape[0]) if isinstance(best_images, torch.Tensor) else 0,
+                },
+                "selected_audio_meta": self._audio_meta(out_audio),
+            }
+        )
+        return (best_images, out_audio, fps_estimate, analysis_json)
 
 
 class SceneSelectorSAM(SceneSelectorUpload):
@@ -849,9 +1154,9 @@ class SceneSelectorSAM(SceneSelectorUpload):
                 "sam2_prompt": ("STRING", {"default": "floor, ground, road"}),
                 "sam2_min_mask_ratio": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "sam2_max_mask_ratio": ("FLOAT", {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.001}),
-                "depth_model": ("STRING", {"default": "LiheYoung/depth-anything-small-hf"}),
+                "depth_model": (DEPTH_MODEL_PRESETS,),
                 "depth_device": (["auto", "cpu", "cuda", "mps"],),
-                "yolo_model": ("STRING", {"default": "yolov8m-seg.pt"}),
+                "yolo_model": (YOLO_MODEL_PRESETS,),
                 "yolo_conf": ("FLOAT", {"default": 0.35, "min": 0.01, "max": 1.0, "step": 0.01}),
                 "yolo_imgsz": ("INT", {"default": 640, "min": 256, "max": 2048}),
                 "sample_fps": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 30.0, "step": 0.1}),
@@ -872,8 +1177,8 @@ class SceneSelectorSAM(SceneSelectorUpload):
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "INT")
-    RETURN_NAMES = ("IMAGE", "audio", "fps_estimate")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "STRING")
+    RETURN_NAMES = ("IMAGE", "audio", "fps_estimate", "analysis_json")
     FUNCTION = "run"
     CATEGORY = "video/scenedetect"
 
@@ -921,13 +1226,24 @@ class SceneSelectorSAM(SceneSelectorUpload):
             duration = float(total_frames) / float(fps) if total_frames > 0 else 0.0
             scenes = [(0.0, max(duration, 0.1))]
 
+        selected_depth_model = self._normalize_choice(
+            value=depth_model,
+            choices=DEPTH_MODEL_PRESETS,
+            fallback="LiheYoung/depth-anything-small-hf",
+        )
+        selected_yolo_model = self._normalize_choice(
+            value=yolo_model,
+            choices=YOLO_MODEL_PRESETS,
+            fallback="yolov8m-seg.pt",
+        )
+
         depth_estimator = DepthEstimator(
-            model_name=str(depth_model),
+            model_name=selected_depth_model,
             device=str(depth_device),
             local_files_only=bool(local_files_only),
             cache_dir=str(cache_dir).strip() if str(cache_dir).strip() else None,
         )
-        yolo = YOLO(str(yolo_model))
+        yolo = YOLO(selected_yolo_model)
         weights = KlingWeights(
             w1_plane=float(w1_plane),
             w2_camera_motion=float(w2_camera_motion),
@@ -941,6 +1257,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
         best_images = None
         best_start_sec = 0.0
         best_end_sec = 0.0
+        scene_scores = []
         for start_sec, end_sec in scenes:
             scene_images = self._read_scene_tensor(
                 video_path=resolved,
@@ -950,7 +1267,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
                 total_frames=total_frames,
                 max_decode_frames_per_scene=int(max_decode_frames_per_scene),
             )
-            score = self._score_scene_kling(
+            score_meta = self._score_scene_kling(
                 scene_images=scene_images,
                 fps=fps,
                 depth_estimator=depth_estimator,
@@ -965,6 +1282,16 @@ class SceneSelectorSAM(SceneSelectorUpload):
                 sam2_prompt=str(sam2_prompt),
                 sam2_min_mask_ratio=float(sam2_min_mask_ratio),
                 sam2_max_mask_ratio=float(sam2_max_mask_ratio),
+            )
+            score = float(score_meta.get("score", 0.0))
+            scene_scores.append(
+                {
+                    "start_sec": float(start_sec),
+                    "end_sec": float(end_sec),
+                    "decoded_frame_count": int(scene_images.shape[0]),
+                    "kling_stability": float(score),
+                    "analysis": score_meta,
+                }
             )
             if score > best_score:
                 best_score = float(score)
@@ -983,7 +1310,60 @@ class SceneSelectorSAM(SceneSelectorUpload):
             end_sec=best_end_sec,
             sample_rate=44100,
         )
-        return (best_images, out_audio, fps_estimate)
+        analysis_json = self._to_json(
+            {
+                "node": "SceneSelectorSAM",
+                "input": {
+                    "video": str(video),
+                    "video_path_override": str(video_path),
+                    "resolved_video_path": str(resolved),
+                    "source_fps": float(fps),
+                    "source_total_frames": int(total_frames),
+                    "fps_estimate": int(fps_estimate),
+                },
+                "params": {
+                    "sam2_prompt": str(sam2_prompt),
+                    "sam2_min_mask_ratio": float(sam2_min_mask_ratio),
+                    "sam2_max_mask_ratio": float(sam2_max_mask_ratio),
+                    "depth_model": selected_depth_model,
+                    "depth_device": str(depth_device),
+                    "yolo_model": selected_yolo_model,
+                    "yolo_conf": float(yolo_conf),
+                    "yolo_imgsz": int(yolo_imgsz),
+                    "sample_fps": float(sample_fps),
+                    "max_frames": int(max_frames),
+                    "max_decode_frames_per_scene": int(max_decode_frames_per_scene),
+                    "invert_depth": bool(invert_depth),
+                    "local_files_only": bool(local_files_only),
+                    "cache_dir": str(cache_dir).strip(),
+                },
+                "weights": {
+                    "w1_plane": float(w1_plane),
+                    "w2_camera_motion": float(w2_camera_motion),
+                    "w3_occlusion": float(w3_occlusion),
+                    "w4_flatness": float(w4_flatness),
+                    "w5_lighting": float(w5_lighting),
+                    "w6_texture": float(w6_texture),
+                },
+                "scenes": [
+                    {
+                        "scene_index": i + 1,
+                        "start_sec": float(s0),
+                        "end_sec": float(e0),
+                    }
+                    for i, (s0, e0) in enumerate(scenes)
+                ],
+                "scene_scores": scene_scores,
+                "best_scene": {
+                    "score": float(best_score),
+                    "start_sec": float(best_start_sec),
+                    "end_sec": float(best_end_sec),
+                    "selected_frame_count": int(best_images.shape[0]) if isinstance(best_images, torch.Tensor) else 0,
+                },
+                "selected_audio_meta": self._audio_meta(out_audio),
+            }
+        )
+        return (best_images, out_audio, fps_estimate, analysis_json)
 
 
 NODE_CLASS_MAPPINGS = {
