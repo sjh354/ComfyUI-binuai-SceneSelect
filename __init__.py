@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import urllib.request
+from urllib.error import HTTPError, URLError
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -54,7 +55,19 @@ YOLO_MODEL_PRESETS = [
     "yolo11x-seg.pt",
 ]
 
-SAM3_CHECKPOINT_URL = "https://huggingface.co/facebook/sam3/resolve/main/sam3.pt"
+SAM3_CHECKPOINT_URL = "https://huggingface.co/DiffusionWave/sam3/resolve/main/sam3.pt"
+SAM3_HF_REPO_CANDIDATES = [
+    "facebook/sam3",
+    "DiffusionWave/sam3",
+    "Justin331/sam3",
+    "bodhicitta/sam3",
+]
+SAM3_URL_CANDIDATES = [
+    "https://huggingface.co/DiffusionWave/sam3/resolve/main/sam3.pt",
+    "https://huggingface.co/Justin331/sam3/resolve/main/sam3.pt",
+    "https://huggingface.co/bodhicitta/sam3/resolve/main/sam3.pt",
+    "https://huggingface.co/facebook/sam3/resolve/main/sam3.pt",
+]
 
 
 class _SAM3ModelWrapper:
@@ -171,23 +184,35 @@ class SAM3ModelLoader:
         if out_path.exists() and not force_download:
             return out_path
 
+        errors = []
+
         # 1) Try huggingface_hub first (handles token auth for gated models).
         try:
             from huggingface_hub import hf_hub_download
 
-            downloaded = hf_hub_download(
-                repo_id="facebook/sam3",
-                filename="sam3.pt",
-                local_dir=str(model_dir),
-                local_dir_use_symlinks=False,
-            )
-            return Path(downloaded)
-        except Exception:
-            pass
+            for repo_id in SAM3_HF_REPO_CANDIDATES:
+                try:
+                    downloaded = hf_hub_download(
+                        repo_id=repo_id,
+                        filename="sam3.pt",
+                        local_dir=str(model_dir),
+                    )
+                    return Path(downloaded)
+                except Exception as exc:
+                    errors.append(f"hf_hub_download[{repo_id}]={exc}")
+        except Exception as exc:
+            errors.append(f"huggingface_hub_import={exc}")
 
-        # 2) Fallback to direct URL download.
-        urllib.request.urlretrieve(SAM3_CHECKPOINT_URL, str(out_path))
-        return out_path
+        # 2) Fallback to direct URL download (public mirrors first).
+        for ckpt_url in SAM3_URL_CANDIDATES:
+            try:
+                urllib.request.urlretrieve(ckpt_url, str(out_path))
+                return out_path
+            except (HTTPError, URLError, OSError) as exc:
+                errors.append(f"urlretrieve[{ckpt_url}]={exc}")
+                continue
+
+        raise RuntimeError("SAM3 checkpoint download failed. " + " | ".join(errors))
 
     def run(self, device, force_download):
         ckpt_path = self._download_checkpoint(self._model_dir(), bool(force_download))

@@ -116,6 +116,23 @@ def nms_fuse_boundaries(boundaries: List[Boundary], merge_window_sec: float = 0.
     return fused
 
 
+def _group_boundaries_for_nms(boundaries: List[Boundary], merge_window_sec: float) -> List[List[Boundary]]:
+    """
+    merge_window_sec 내에 있는 boundary들을 하나의 그룹으로 묶는다.
+    """
+    if not boundaries:
+        return []
+    sorted_b = sorted(boundaries, key=lambda b: b.t)
+    groups: List[List[Boundary]] = [[sorted_b[0]]]
+    for b in sorted_b[1:]:
+        last = groups[-1][-1]
+        if abs(b.t - last.t) <= merge_window_sec:
+            groups[-1].append(b)
+        else:
+            groups.append([b])
+    return groups
+
+
 def build_scenes_from_boundaries(boundaries: List[Boundary], video_duration_sec: float) -> List[Tuple[float, float]]:
     """
     boundary 시간들을 scene 구간으로 변환.
@@ -196,6 +213,7 @@ def detect_scenes(
     camera_min_matches: int = 60,
     merge_window_sec: float = 0.30,
     weights: Optional[Dict[str, float]] = None,
+    print_cut_reasons: bool = True,
 ) -> Tuple[List[Tuple[float, float]], List[Boundary]]:
     if not transnet_weights_dir:
         transnet_weights_dir = _default_transnet_weights_dir()
@@ -259,20 +277,60 @@ def detect_scenes(
     all_b.extend(b_pys)
     all_b.extend(b_cam)
 
-    fused = nms_fuse_boundaries(all_b, merge_window_sec=merge_window_sec)
+    grouped = _group_boundaries_for_nms(all_b, merge_window_sec=merge_window_sec)
+    fused: List[Boundary] = []
+    nms_reason_map: Dict[Tuple[float, str, str], str] = {}
+    for g in grouped:
+        winner = max(g, key=lambda x: x.score)
+        fused.append(winner)
+        key = (winner.t, winner.source, winner.kind)
+        src_summary = ", ".join(f"{x.source}:{x.score:.3f}@{x.t:.3f}s" for x in sorted(g, key=lambda y: y.score, reverse=True))
+        if len(g) > 1:
+            nms_reason_map[key] = (
+                f"merged {len(g)} nearby candidates within {merge_window_sec:.2f}s; "
+                f"selected highest score from [{src_summary}]"
+            )
+        else:
+            nms_reason_map[key] = "single candidate in merge window"
 
     filtered = []
+    accepted_reasons: Dict[Tuple[float, str, str], str] = {}
     for b in fused:
         if b.source == "audio":
             continue
         if b.source == "camera":
             if b.score >= 0.30:
                 filtered.append(b)
+                accepted_reasons[(b.t, b.source, b.kind)] = (
+                    f"camera final gate passed (score {b.score:.3f} >= 0.300)"
+                )
         elif b.score >= 0.35:
             filtered.append(b)
+            accepted_reasons[(b.t, b.source, b.kind)] = (
+                f"{b.source} final gate passed (score {b.score:.3f} >= 0.350)"
+            )
 
     for b in filtered:
-        b.score *= weights.get(b.source, 1.0)
+        raw_score = b.score
+        w = float(weights.get(b.source, 1.0))
+        b.score = raw_score * w
+        if print_cut_reasons:
+            key = (b.t, b.source, b.kind)
+            base_reason = accepted_reasons.get(key, "passed filtering")
+            nms_reason = nms_reason_map.get(key, "")
+            kind_extra = ""
+            if b.source == "transnet" and b.kind == "transition":
+                kind_extra = f", transition_score={b.trans_score:.3f}, seg_len={b.seg_len}"
+            print(
+                "[detect_scenes][CUT]",
+                f"t={b.t:.3f}s",
+                f"source={b.source}",
+                f"kind={b.kind}",
+                f"raw={raw_score:.3f}",
+                f"weight={w:.3f}",
+                f"weighted={b.score:.3f}",
+                f"reason={base_reason}; {nms_reason}{kind_extra}",
+            )
 
     scenes = build_scenes_from_boundaries(filtered, video_duration_sec=duration)
     return scenes, filtered
