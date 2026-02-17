@@ -280,6 +280,35 @@ class SceneSelectorKling:
         return json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default)
 
     @staticmethod
+    def _compact_score_meta(score_meta: Mapping | dict | None) -> dict:
+        if not isinstance(score_meta, Mapping):
+            return {}
+        out = {}
+        keep_keys = (
+            "score",
+            "sampled_frames",
+            "scene_total_frames",
+            "sampling_step",
+            "sampled_frame_indices",
+            "components",
+            "metrics",
+            "mask_stats",
+            "motion_signal_stats",
+            "frame_debug_samples",
+        )
+        for k in keep_keys:
+            if k in score_meta:
+                out[k] = score_meta.get(k)
+        sam2_stats = score_meta.get("sam2_stats")
+        if isinstance(sam2_stats, Mapping):
+            out["sam2_stats"] = {
+                k: v
+                for k, v in sam2_stats.items()
+                if k not in {"sam2_prompt", "sam2_min_mask_ratio", "sam2_max_mask_ratio"}
+            }
+        return out
+
+    @staticmethod
     def _normalize_choice(value, choices: list[str], fallback: str) -> str:
         s = str(value).strip()
         if s in choices:
@@ -838,6 +867,9 @@ class SceneSelectorKling:
             cut_threshold=float(cut_threshold),
             min_scene_len_frames=int(min_scene_len_frames),
         )
+        used_single_scene_fallback = bool(
+            len(scenes) == 1 and int(scenes[0][0]) == 0 and int(scenes[0][1]) == int(total)
+        )
 
         selected_depth_model = self._normalize_choice(
             value=depth_model,
@@ -910,55 +942,38 @@ class SceneSelectorKling:
                 f"end_frame_exclusive={e}",
             )
             out_audio = self._slice_audio_by_time(audio, start_sec=start_sec, end_sec=end_sec)
+        best_analysis = self._compact_score_meta(best.get("analysis") if isinstance(best, Mapping) else None)
+        if best:
+            s = int(best["start_frame"])
+            e = int(best["end_frame_exclusive"])
+            selected_scene = {
+                "scene_index": int(best["scene_index"]),
+                "start_frame": int(s),
+                "end_frame_exclusive": int(e),
+                "start_sec": float(s / fps),
+                "end_sec": float(e / fps),
+                "frame_count": int(max(0, e - s)),
+                "kling_stability": float(best.get("kling_stability", 0.0)),
+            }
+        else:
+            selected_scene = {
+                "scene_index": 1,
+                "start_frame": 0,
+                "end_frame_exclusive": int(total),
+                "start_sec": 0.0,
+                "end_sec": float(total / fps),
+                "frame_count": int(total),
+                "kling_stability": 0.0,
+            }
         analysis_json = self._to_json(
             {
                 "node": "SceneSelectorKling",
-                "input": {
-                    "total_frames": int(total),
-                    "fps": float(fps),
-                    "fps_estimate": int(fps_estimate),
-                    "video_info": dict(video_info) if isinstance(video_info, Mapping) else str(type(video_info)),
-                    "audio_meta": self._audio_meta(audio),
+                "scene_detection": {
+                    "scene_count": int(len(scenes)),
+                    "used_single_scene_fallback": bool(used_single_scene_fallback),
                 },
-                "params": {
-                    "cut_threshold": float(cut_threshold),
-                    "min_scene_len_frames": int(min_scene_len_frames),
-                    "depth_model": selected_depth_model,
-                    "depth_device": str(depth_device),
-                    "yolo_model": selected_yolo_model,
-                    "yolo_conf": float(yolo_conf),
-                    "yolo_imgsz": int(yolo_imgsz),
-                    "sample_fps": float(sample_fps),
-                    "max_frames": int(max_frames),
-                    "invert_depth": bool(invert_depth),
-                    "local_files_only": bool(local_files_only),
-                    "cache_dir": str(cache_dir).strip(),
-                },
-                "weights": {
-                    "w1_plane": float(w1_plane),
-                    "w2_camera_motion": float(w2_camera_motion),
-                    "w3_occlusion": float(w3_occlusion),
-                    "w4_flatness": float(w4_flatness),
-                    "w5_lighting": float(w5_lighting),
-                    "w6_texture": float(w6_texture),
-                },
-                "scene_ranges": [
-                    {
-                        "scene_index": i + 1,
-                        "start_frame": int(s0),
-                        "end_frame_exclusive": int(e0),
-                        "frame_count": int(max(0, e0 - s0)),
-                        "start_sec": float(s0 / fps),
-                        "end_sec": float(e0 / fps),
-                    }
-                    for i, (s0, e0) in enumerate(scenes)
-                ],
-                "scene_scores": scene_scores,
-                "best_scene": best if best is not None else None,
-                "selected_output": {
-                    "selected_frame_count": int(out_images.shape[0]),
-                    "selected_audio_meta": self._audio_meta(out_audio),
-                },
+                "selected_scene": selected_scene,
+                "analysis": best_analysis,
             }
         )
         return (out_images, out_audio, fps_estimate, analysis_json)
@@ -1173,7 +1188,9 @@ class SceneSelectorUpload(SceneSelectorKling):
         fps_estimate = int(round(fps))
 
         scenes, _ = detect_scenes(str(resolved))
+        used_single_scene_fallback = False
         if not scenes:
+            used_single_scene_fallback = True
             duration = float(total_frames) / float(fps) if total_frames > 0 else 0.0
             scenes = [(0.0, max(duration, 0.1))]
 
@@ -1208,6 +1225,7 @@ class SceneSelectorUpload(SceneSelectorKling):
         best_images = None
         best_start_sec = 0.0
         best_end_sec = 0.0
+        best_meta = {}
         scene_scores = []
         for start_sec, end_sec in scenes:
             scene_images = self._read_scene_tensor(
@@ -1245,6 +1263,7 @@ class SceneSelectorUpload(SceneSelectorKling):
                 best_images = scene_images
                 best_start_sec = float(start_sec)
                 best_end_sec = float(end_sec)
+                best_meta = dict(score_meta)
 
         if best_images is None:
             best_images = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
@@ -1257,54 +1276,22 @@ class SceneSelectorUpload(SceneSelectorKling):
             end_sec=best_end_sec,
             sample_rate=44100,
         )
+        selected_scene = {
+            "start_sec": float(best_start_sec),
+            "end_sec": float(best_end_sec),
+            "duration_sec": float(max(0.0, best_end_sec - best_start_sec)),
+            "selected_frame_count": int(best_images.shape[0]) if isinstance(best_images, torch.Tensor) else 0,
+            "kling_stability": float(best_score) if best_score >= 0 else 0.0,
+        }
         analysis_json = self._to_json(
             {
                 "node": "SceneSelectorUpload",
-                "input": {
-                    "video": str(video),
-                    "video_path_override": str(video_path),
-                    "resolved_video_path": str(resolved),
-                    "source_fps": float(fps),
-                    "source_total_frames": int(total_frames),
-                    "fps_estimate": int(fps_estimate),
+                "scene_detection": {
+                    "scene_count": int(len(scenes)),
+                    "used_single_scene_fallback": bool(used_single_scene_fallback),
                 },
-                "params": {
-                    "depth_model": selected_depth_model,
-                    "depth_device": str(depth_device),
-                    "yolo_model": selected_yolo_model,
-                    "yolo_conf": float(yolo_conf),
-                    "yolo_imgsz": int(yolo_imgsz),
-                    "sample_fps": float(sample_fps),
-                    "max_frames": int(max_frames),
-                    "max_decode_frames_per_scene": int(max_decode_frames_per_scene),
-                    "invert_depth": bool(invert_depth),
-                    "local_files_only": bool(local_files_only),
-                    "cache_dir": str(cache_dir).strip(),
-                },
-                "weights": {
-                    "w1_plane": float(w1_plane),
-                    "w2_camera_motion": float(w2_camera_motion),
-                    "w3_occlusion": float(w3_occlusion),
-                    "w4_flatness": float(w4_flatness),
-                    "w5_lighting": float(w5_lighting),
-                    "w6_texture": float(w6_texture),
-                },
-                "scenes": [
-                    {
-                        "scene_index": i + 1,
-                        "start_sec": float(s0),
-                        "end_sec": float(e0),
-                    }
-                    for i, (s0, e0) in enumerate(scenes)
-                ],
-                "scene_scores": scene_scores,
-                "best_scene": {
-                    "score": float(best_score),
-                    "start_sec": float(best_start_sec),
-                    "end_sec": float(best_end_sec),
-                    "selected_frame_count": int(best_images.shape[0]) if isinstance(best_images, torch.Tensor) else 0,
-                },
-                "selected_audio_meta": self._audio_meta(out_audio),
+                "selected_scene": selected_scene,
+                "analysis": self._compact_score_meta(best_meta),
             }
         )
         return (best_images, out_audio, fps_estimate, analysis_json)
@@ -1394,7 +1381,9 @@ class SceneSelectorSAM(SceneSelectorUpload):
         fps_estimate = int(round(fps))
 
         scenes, _ = detect_scenes(str(resolved))
+        used_single_scene_fallback = False
         if not scenes:
+            used_single_scene_fallback = True
             duration = float(total_frames) / float(fps) if total_frames > 0 else 0.0
             scenes = [(0.0, max(duration, 0.1))]
 
@@ -1429,6 +1418,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
         best_images = None
         best_start_sec = 0.0
         best_end_sec = 0.0
+        best_meta = {}
         scene_scores = []
         for start_sec, end_sec in scenes:
             scene_images = self._read_scene_tensor(
@@ -1470,6 +1460,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
                 best_images = scene_images
                 best_start_sec = float(start_sec)
                 best_end_sec = float(end_sec)
+                best_meta = dict(score_meta)
 
         if best_images is None:
             best_images = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
@@ -1482,57 +1473,22 @@ class SceneSelectorSAM(SceneSelectorUpload):
             end_sec=best_end_sec,
             sample_rate=44100,
         )
+        selected_scene = {
+            "start_sec": float(best_start_sec),
+            "end_sec": float(best_end_sec),
+            "duration_sec": float(max(0.0, best_end_sec - best_start_sec)),
+            "selected_frame_count": int(best_images.shape[0]) if isinstance(best_images, torch.Tensor) else 0,
+            "kling_stability": float(best_score) if best_score >= 0 else 0.0,
+        }
         analysis_json = self._to_json(
             {
                 "node": "SceneSelectorSAM",
-                "input": {
-                    "video": str(video),
-                    "video_path_override": str(video_path),
-                    "resolved_video_path": str(resolved),
-                    "source_fps": float(fps),
-                    "source_total_frames": int(total_frames),
-                    "fps_estimate": int(fps_estimate),
+                "scene_detection": {
+                    "scene_count": int(len(scenes)),
+                    "used_single_scene_fallback": bool(used_single_scene_fallback),
                 },
-                "params": {
-                    "sam2_prompt": str(sam2_prompt),
-                    "sam2_min_mask_ratio": float(sam2_min_mask_ratio),
-                    "sam2_max_mask_ratio": float(sam2_max_mask_ratio),
-                    "depth_model": selected_depth_model,
-                    "depth_device": str(depth_device),
-                    "yolo_model": selected_yolo_model,
-                    "yolo_conf": float(yolo_conf),
-                    "yolo_imgsz": int(yolo_imgsz),
-                    "sample_fps": float(sample_fps),
-                    "max_frames": int(max_frames),
-                    "max_decode_frames_per_scene": int(max_decode_frames_per_scene),
-                    "invert_depth": bool(invert_depth),
-                    "local_files_only": bool(local_files_only),
-                    "cache_dir": str(cache_dir).strip(),
-                },
-                "weights": {
-                    "w1_plane": float(w1_plane),
-                    "w2_camera_motion": float(w2_camera_motion),
-                    "w3_occlusion": float(w3_occlusion),
-                    "w4_flatness": float(w4_flatness),
-                    "w5_lighting": float(w5_lighting),
-                    "w6_texture": float(w6_texture),
-                },
-                "scenes": [
-                    {
-                        "scene_index": i + 1,
-                        "start_sec": float(s0),
-                        "end_sec": float(e0),
-                    }
-                    for i, (s0, e0) in enumerate(scenes)
-                ],
-                "scene_scores": scene_scores,
-                "best_scene": {
-                    "score": float(best_score),
-                    "start_sec": float(best_start_sec),
-                    "end_sec": float(best_end_sec),
-                    "selected_frame_count": int(best_images.shape[0]) if isinstance(best_images, torch.Tensor) else 0,
-                },
-                "selected_audio_meta": self._audio_meta(out_audio),
+                "selected_scene": selected_scene,
+                "analysis": self._compact_score_meta(best_meta),
             }
         )
         return (best_images, out_audio, fps_estimate, analysis_json)
