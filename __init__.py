@@ -226,6 +226,120 @@ class SAM3ModelLoader:
         return (sam2_model_payload, str(ckpt_path))
 
 
+class KlingPromptFromAnalysis:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "analysis_json": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+                "reference_caption": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "run"
+    CATEGORY = "video/scenedetect"
+
+    @staticmethod
+    def _to_float(value, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _level(v: float, hi: float = 0.7, lo: float = 0.4) -> str:
+        if v >= hi:
+            return "high"
+        if v >= lo:
+            return "medium"
+        return "low"
+
+    def run(self, analysis_json, reference_caption):
+        parsed = {}
+        if isinstance(analysis_json, Mapping):
+            parsed = dict(analysis_json)
+        else:
+            raw = str(analysis_json or "").strip()
+            if raw:
+                try:
+                    obj = json.loads(raw)
+                    if isinstance(obj, Mapping):
+                        parsed = dict(obj)
+                except Exception:
+                    parsed = {}
+
+        analysis = parsed.get("analysis", {}) if isinstance(parsed, Mapping) else {}
+        metrics = analysis.get("metrics", {}) if isinstance(analysis, Mapping) else {}
+        selected_scene = parsed.get("selected_scene", {}) if isinstance(parsed, Mapping) else {}
+
+        score = self._to_float(analysis.get("score", 0.0))
+        cam_score = self._to_float(metrics.get("camera_motion", {}).get("camera_motion_score", 0.0))
+        occ_score = self._to_float(metrics.get("occlusion", {}).get("occlusion_score", 0.0))
+        flat_score = self._to_float(metrics.get("flatness", {}).get("flatness_score", 0.0))
+        light_score = self._to_float(metrics.get("lighting", {}).get("lighting_stability", 0.0))
+        tex_score = self._to_float(metrics.get("texture", {}).get("texture_score", 0.0))
+        plane_score = self._to_float(metrics.get("plane_score", 0.0))
+        plane_count = int(self._to_float(metrics.get("plane_count", 0)))
+        pitch_hint = str(metrics.get("pitch_hint", "level"))
+        height_hint = str(metrics.get("camera_height_hint", "eye"))
+        scene_start = self._to_float(selected_scene.get("start_sec", 0.0))
+        scene_end = self._to_float(selected_scene.get("end_sec", 0.0))
+
+        caption = str(reference_caption or "").strip()
+        if not caption:
+            caption = "an object"
+        caption_phrase = caption.rstrip(" .")
+        object_ref = f"the referenced object ({caption_phrase})"
+
+        base_prompt = (
+            f"Insert {caption_phrase} from [@Image] into [@Video].\n\n"
+            "The object must appear at the same position, scale, color, tone and orientation\n"
+            "as in [@Image], relative to the video frame.\n\n"
+            "The placement must remain fixed and unchanged across all frames.\n"
+            "Do not move, shift, or reposition the object at any time.\n\n"
+            "Ensure natural lighting, shadows, and perspective integration."
+        )
+
+        guidance = [
+            (
+                "Measured video constraints: "
+                f"stability={score:.2f}, camera_motion={cam_score:.2f}, occlusion_safety={occ_score:.2f}, "
+                f"flatness={flat_score:.2f}, lighting_stability={light_score:.2f}, texture_stability={tex_score:.2f}, "
+                f"floor_plane_confidence={plane_score:.2f} (plane_count={plane_count}), "
+                f"camera_pitch_hint={pitch_hint}, camera_height_hint={height_hint}, "
+                f"scene_window={scene_start:.3f}s-{scene_end:.3f}s."
+            ),
+            f"MUST keep {object_ref} fully locked to one fixed floor position in all frames.",
+            f"MUST preserve identical pose, footprint, orientation, and scale of {object_ref} in every frame.",
+            f"MUST keep color/contrast/tone of {object_ref} stable with no temporal flicker.",
+            f"MUST keep physically coherent contact shadow and perspective of {object_ref} on the floor plane.",
+            f"NEVER translate, rotate, resize, warp, or jitter {object_ref} over time.",
+            f"NEVER let moving foreground objects erase, cut, or deform {object_ref}.",
+        ]
+
+        if occ_score < 0.40:
+            guidance.append(
+                "CRITICAL: occlusion risk is high. Prioritize can integrity and continuity when objects cross in front."
+            )
+        if cam_score < 0.70:
+            guidance.append(
+                "CRITICAL: camera motion is non-trivial. Enforce strict floor-lock and zero drift under motion."
+            )
+        if flat_score < 0.40:
+            guidance.append(
+                "CRITICAL: floor flatness is weak. Prevent floating/sinking by enforcing stable ground contact."
+            )
+        if light_score < 0.50:
+            guidance.append(
+                "CRITICAL: lighting is unstable. Keep shadow direction/intensity temporally consistent."
+            )
+
+        prompt = base_prompt + "\n\n" + "\n".join(guidance)
+        return (prompt,)
+
+
 class SceneSelectorKling:
     @classmethod
     def INPUT_TYPES(cls):
@@ -610,6 +724,7 @@ class SceneSelectorKling:
             TextureStabilityMetric,
             compute_floor_mask,
         )
+        from video_analysis_utils.geometry_metrics import depth_metrics, derive_hints
         from video_analysis_utils.motion_zoom import estimate_pair_transform, pair_motion_signal
         from video_analysis_utils.plane_analysis import compute_plane_metrics, extract_planes_from_depth, update_plane_tracks
 
@@ -634,6 +749,7 @@ class SceneSelectorKling:
         floor_ratios = []
         dynamic_ratios = []
         motion_values = []
+        depth_geometry_series = []
         sam2_used_count = 0
         sam2_fallback_count = 0
         sam2_empty_or_error_count = 0
@@ -659,6 +775,17 @@ class SceneSelectorKling:
             prev_gray = gray
 
             depth = depth_estimator.predict_depth(frame_bgr)
+            geo = depth_metrics(depth=depth, near_q=0.15, far_q=0.85, invert_depth=bool(invert_depth))
+            depth_geometry_series.append(
+                {
+                    "top_mean": float(geo.get("top_mean", 0.0)),
+                    "mid_mean": float(geo.get("mid_mean", 0.0)),
+                    "bottom_mean": float(geo.get("bottom_mean", 0.0)),
+                    "vertical_gradient": float(geo.get("vertical_gradient", 0.0)),
+                    "near_ratio": float(geo.get("near_ratio", 0.0)),
+                    "far_ratio": float(geo.get("far_ratio", 0.0)),
+                }
+            )
             frame_planes, residual_thr = extract_planes_from_depth(depth)
             update_plane_tracks(plane_tracks, frame_planes, frame_index=int(sid))
             residual_thresholds.append(residual_thr)
@@ -738,6 +865,33 @@ class SceneSelectorKling:
         comp_texture = float(weights.w6_texture) * float(texture_out["texture_score"])
         score = float(np.clip(comp_plane + comp_camera + comp_occlusion + comp_flatness + comp_lighting + comp_texture, 0.0, 1.0))
 
+        if depth_geometry_series:
+            top_mean = float(np.mean([x["top_mean"] for x in depth_geometry_series]))
+            mid_mean = float(np.mean([x["mid_mean"] for x in depth_geometry_series]))
+            bottom_mean = float(np.mean([x["bottom_mean"] for x in depth_geometry_series]))
+            vertical_gradient = float(np.mean([x["vertical_gradient"] for x in depth_geometry_series]))
+            near_ratio = float(np.mean([x["near_ratio"] for x in depth_geometry_series]))
+            far_ratio = float(np.mean([x["far_ratio"] for x in depth_geometry_series]))
+            hints = derive_hints(
+                {
+                    "top_mean": {"mean": top_mean},
+                    "mid_mean": {"mean": mid_mean},
+                    "bottom_mean": {"mean": bottom_mean},
+                    "vertical_gradient": {"mean": vertical_gradient},
+                }
+            )
+            camera_height_hint = str(hints.get("camera_height_hint", "eye"))
+            pitch_hint = str(hints.get("pitch_hint", "level"))
+        else:
+            top_mean = 0.0
+            mid_mean = 0.0
+            bottom_mean = 0.0
+            vertical_gradient = 0.0
+            near_ratio = 0.0
+            far_ratio = 0.0
+            camera_height_hint = "eye"
+            pitch_hint = "level"
+
         return {
             "score": score,
             "sampled_frames": int(sampled),
@@ -769,6 +923,14 @@ class SceneSelectorKling:
                 "occlusion": occlusion_out,
                 "flatness": flatness_out,
                 "lighting": lighting_out,
+                "top_mean": float(top_mean),
+                "mid_mean": float(mid_mean),
+                "bottom_mean": float(bottom_mean),
+                "vertical_gradient": float(vertical_gradient),
+                "near_ratio": float(near_ratio),
+                "far_ratio": float(far_ratio),
+                "camera_height_hint": str(camera_height_hint),
+                "pitch_hint": str(pitch_hint),
             },
             "mask_stats": {
                 "floor_ratio_mean": float(np.mean(floor_ratios)) if floor_ratios else 0.0,
@@ -1496,6 +1658,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
 
 NODE_CLASS_MAPPINGS = {
     "SAM3ModelLoader": SAM3ModelLoader,
+    "KlingPromptFromAnalysis": KlingPromptFromAnalysis,
     "SceneSelectorKling": SceneSelectorKling,
     "SceneSelectorUpload": SceneSelectorUpload,
     "SceneSelectorSAM": SceneSelectorSAM,
@@ -1503,6 +1666,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SAM3ModelLoader": "SAM3 Model Loader",
+    "KlingPromptFromAnalysis": "Kling Prompt Builder (Analysis + Caption)",
     "SceneSelectorKling": "Scene Selector (Without Upload)",
     "SceneSelectorUpload": "Scene Selector (Upload)",
     "SceneSelectorSAM": "Scene Selector (SAM)",
