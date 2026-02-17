@@ -6,6 +6,18 @@ import cv2
 import numpy as np
 
 
+def _moving_average_1d(x: np.ndarray, window: int) -> np.ndarray:
+    if window <= 1 or x.size == 0:
+        return x
+    w = int(max(1, window))
+    if w % 2 == 0:
+        w += 1
+    pad = w // 2
+    xp = np.pad(x, (pad, pad), mode="edge")
+    kernel = np.ones((w,), dtype=np.float32) / float(w)
+    return np.convolve(xp, kernel, mode="valid").astype(np.float32)
+
+
 def run_camera_jump(
     video_path: str,
     fps: float,
@@ -88,16 +100,38 @@ def run_camera_jump(
 
     cap.release()
 
-    p = np.array(scores, dtype=np.float32)
+    p_raw = np.array(scores, dtype=np.float32)
+    if p_raw.size == 0:
+        return []
+
+    # Suppress single-frame spikes by requiring neighborhood support
+    # around a candidate (or a very strong raw peak).
+    p = _moving_average_1d(p_raw, window=5)
     idx = np.where(p >= threshold)[0]
     boundaries: List[Boundary] = []
     if len(idx) == 0:
         return boundaries
 
+    support_radius = 2
+    support_min_count = 2
+    near_thr = float(threshold) * 0.85
+    very_strong_thr = min(1.0, float(threshold) + 0.20)
+
+    valid_idx = []
+    for i in idx.tolist():
+        a0 = max(0, int(i) - support_radius)
+        b0 = min(int(p_raw.size), int(i) + support_radius + 1)
+        support_count = int(np.sum(p_raw[a0:b0] >= near_thr))
+        if support_count >= support_min_count or float(p_raw[int(i)]) >= very_strong_thr:
+            valid_idx.append(int(i))
+
+    if not valid_idx:
+        return boundaries
+
     groups = []
-    start = idx[0]
-    prev_i = idx[0]
-    for k in idx[1:]:
+    start = valid_idx[0]
+    prev_i = valid_idx[0]
+    for k in valid_idx[1:]:
         if k == prev_i + 1:
             prev_i = k
         else:
