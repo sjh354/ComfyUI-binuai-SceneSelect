@@ -168,7 +168,7 @@ class SAM3ModelLoader:
     RETURN_TYPES = ("SAM2_MODEL", "STRING")
     RETURN_NAMES = ("sam2_model", "checkpoint_path")
     FUNCTION = "run"
-    CATEGORY = "video/scenedetect"
+    CATEGORY = "binu_ai/scenedetect"
 
     def _model_dir(self) -> Path:
         if folder_paths is not None:
@@ -239,7 +239,7 @@ class KlingPromptFromAnalysis:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("prompt",)
     FUNCTION = "run"
-    CATEGORY = "video/scenedetect"
+    CATEGORY = "binu_ai/scenedetect"
 
     @staticmethod
     def _to_float(value, default: float = 0.0) -> float:
@@ -291,52 +291,64 @@ class KlingPromptFromAnalysis:
         if not caption:
             caption = "an object"
         caption_phrase = caption.rstrip(" .")
-        object_ref = f"the referenced object ({caption_phrase})"
+        object_ref = "the target object"
 
         base_prompt = (
             f"Insert {caption_phrase} from [@Image] into [@Video].\n\n"
-            "The object must appear at the same position, scale, color, tone and orientation\n"
-            "as in [@Image], relative to the video frame.\n\n"
-            "The placement must remain fixed and unchanged across all frames.\n"
-            "Do not move, shift, or reposition the object at any time.\n\n"
-            "Ensure natural lighting, shadows, and perspective integration."
+            f"Target object: {caption_phrase}\n\n"
+            "Placement:\n"
+            f"- MUST anchor {object_ref} to one fixed floor position for the full clip.\n"
+            f"- MUST preserve the same footprint, orientation, and scale of {object_ref} in every frame.\n\n"
+            "Appearance:\n"
+            f"- MUST match color, tone, and material appearance of {object_ref} from [@Image].\n"
+            f"- MUST keep natural perspective and contact shadow of {object_ref} on the floor.\n\n"
+            "Temporal consistency:\n"
+            f"- NEVER translate, rotate, resize, warp, or jitter {object_ref} over time.\n"
+            f"- NEVER introduce flicker in {object_ref} edges, color, or shading.\n\n"
+            "Occlusion behavior:\n"
+            f"- NEVER let moving foreground objects erase, cut, or deform {object_ref}.\n"
+            f"- Keep {object_ref} geometrically stable even during crossings."
         )
 
-        guidance = [
-            (
-                "Measured video constraints: "
-                f"stability={score:.2f}, camera_motion={cam_score:.2f}, occlusion_safety={occ_score:.2f}, "
-                f"flatness={flat_score:.2f}, lighting_stability={light_score:.2f}, texture_stability={tex_score:.2f}, "
-                f"floor_plane_confidence={plane_score:.2f} (plane_count={plane_count}), "
-                f"camera_pitch_hint={pitch_hint}, camera_height_hint={height_hint}, "
-                f"scene_window={scene_start:.3f}s-{scene_end:.3f}s."
-            ),
-            f"MUST keep {object_ref} fully locked to one fixed floor position in all frames.",
-            f"MUST preserve identical pose, footprint, orientation, and scale of {object_ref} in every frame.",
-            f"MUST keep color/contrast/tone of {object_ref} stable with no temporal flicker.",
-            f"MUST keep physically coherent contact shadow and perspective of {object_ref} on the floor plane.",
-            f"NEVER translate, rotate, resize, warp, or jitter {object_ref} over time.",
-            f"NEVER let moving foreground objects erase, cut, or deform {object_ref}.",
-        ]
-
+        risk_lines = []
         if occ_score < 0.40:
-            guidance.append(
-                "CRITICAL: occlusion risk is high. Prioritize can integrity and continuity when objects cross in front."
+            risk_lines.append(
+                f"- High occlusion risk (occlusion_safety={occ_score:.2f}): prioritize integrity under foreground crossings."
             )
         if cam_score < 0.70:
-            guidance.append(
-                "CRITICAL: camera motion is non-trivial. Enforce strict floor-lock and zero drift under motion."
+            risk_lines.append(
+                f"- Camera motion risk (camera_motion={cam_score:.2f}): enforce strict floor-lock and zero drift."
             )
         if flat_score < 0.40:
-            guidance.append(
-                "CRITICAL: floor flatness is weak. Prevent floating/sinking by enforcing stable ground contact."
+            risk_lines.append(
+                f"- Flatness risk (flatness={flat_score:.2f}): avoid floating/sinking; maintain firm ground contact."
             )
         if light_score < 0.50:
-            guidance.append(
-                "CRITICAL: lighting is unstable. Keep shadow direction/intensity temporally consistent."
+            risk_lines.append(
+                f"- Lighting risk (lighting_stability={light_score:.2f}): keep shadow direction/intensity temporally coherent."
+            )
+        if tex_score < 0.50:
+            risk_lines.append(
+                f"- Texture risk (texture_stability={tex_score:.2f}): suppress edge shimmer and local jitter on textured ground."
+            )
+        if plane_score < 0.35 or plane_count <= 1:
+            risk_lines.append(
+                f"- Floor-plane confidence risk (plane_score={plane_score:.2f}, plane_count={plane_count}): keep placement conservative and locked to dominant lower-plane cues."
             )
 
-        prompt = base_prompt + "\n\n" + "\n".join(guidance)
+        metrics_summary = (
+            "Metrics snapshot: "
+            f"stability={score:.2f}, camera_motion={cam_score:.2f}, occlusion_safety={occ_score:.2f}, "
+            f"flatness={flat_score:.2f}, lighting_stability={light_score:.2f}, texture_stability={tex_score:.2f}, "
+            f"floor_plane_confidence={plane_score:.2f} (plane_count={plane_count}), "
+            f"camera_pitch_hint={pitch_hint}, camera_height_hint={height_hint}, "
+            f"scene_window={scene_start:.3f}s-{scene_end:.3f}s."
+        )
+
+        if risk_lines:
+            prompt = base_prompt + "\n\nRisk directives:\n" + "\n".join(risk_lines) + "\n\n" + metrics_summary
+        else:
+            prompt = base_prompt + "\n\nMetrics snapshot: stable scene, no major risk flags.\n" + metrics_summary
         return (prompt,)
 
 
@@ -372,7 +384,7 @@ class SceneSelectorKling:
     RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "STRING")
     RETURN_NAMES = ("IMAGE", "audio", "fps_estimate", "analysis_json")
     FUNCTION = "run"
-    CATEGORY = "video/scenedetect"
+    CATEGORY = "binu_ai/scenedetect"
 
     @staticmethod
     def _json_default(obj):
@@ -1203,7 +1215,7 @@ class SceneSelectorUpload(SceneSelectorKling):
     RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "STRING")
     RETURN_NAMES = ("IMAGE", "audio", "fps_estimate", "analysis_json")
     FUNCTION = "run"
-    CATEGORY = "video/scenedetect"
+    CATEGORY = "binu_ai/scenedetect"
 
     def _resolve_video_path(self, video: str) -> Path:
         p = Path(str(video))
@@ -1501,7 +1513,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
     RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "STRING")
     RETURN_NAMES = ("IMAGE", "audio", "fps_estimate", "analysis_json")
     FUNCTION = "run"
-    CATEGORY = "video/scenedetect"
+    CATEGORY = "binu_ai/scenedetect"
 
     def run(
         self,
