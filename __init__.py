@@ -256,6 +256,14 @@ class KlingPromptFromAnalysis:
             return "medium"
         return "low"
 
+    @staticmethod
+    def _risk_label(v: float, good_hi: float = 0.7, warn_lo: float = 0.4) -> str:
+        if v < warn_lo:
+            return "high risk"
+        if v < good_hi:
+            return "moderate risk"
+        return "low risk"
+
     def run(self, analysis_json, reference_caption):
         parsed = {}
         if isinstance(analysis_json, Mapping):
@@ -336,19 +344,27 @@ class KlingPromptFromAnalysis:
                 f"- Floor-plane confidence risk (plane_score={plane_score:.2f}, plane_count={plane_count}): keep placement conservative and locked to dominant lower-plane cues."
             )
 
-        metrics_summary = (
-            "Metrics snapshot: "
-            f"stability={score:.2f}, camera_motion={cam_score:.2f}, occlusion_safety={occ_score:.2f}, "
-            f"flatness={flat_score:.2f}, lighting_stability={light_score:.2f}, texture_stability={tex_score:.2f}, "
-            f"floor_plane_confidence={plane_score:.2f} (plane_count={plane_count}), "
-            f"camera_pitch_hint={pitch_hint}, camera_height_hint={height_hint}, "
-            f"scene_window={scene_start:.3f}s-{scene_end:.3f}s."
-        )
+        metrics_brief = [
+            "Scene analysis brief:",
+            f"- Overall stability: {self._risk_label(score)} ({score:.2f}).",
+            f"- Camera motion: {self._risk_label(cam_score)} ({cam_score:.2f}); lower means drift pressure is higher.",
+            f"- Occlusion safety: {self._risk_label(occ_score)} ({occ_score:.2f}); lower means crossings are likely.",
+            f"- Floor flatness: {self._risk_label(flat_score)} ({flat_score:.2f}); lower means floating/sinking risk.",
+            f"- Lighting stability: {self._risk_label(light_score)} ({light_score:.2f}); lower means shadow inconsistency risk.",
+            f"- Texture stability: {self._risk_label(tex_score)} ({tex_score:.2f}); lower means edge jitter risk.",
+            (
+                f"- Floor-plane confidence: {self._risk_label(plane_score)} ({plane_score:.2f}, planes={plane_count}); "
+                "lower means anchoring is less reliable."
+            ),
+            f"- Camera orientation hint: pitch={pitch_hint}, height={height_hint}.",
+            f"- Selected scene window: {scene_start:.3f}s-{scene_end:.3f}s.",
+        ]
+        metrics_summary = "\n".join(metrics_brief)
 
         if risk_lines:
             prompt = base_prompt + "\n\nRisk directives:\n" + "\n".join(risk_lines) + "\n\n" + metrics_summary
         else:
-            prompt = base_prompt + "\n\nMetrics snapshot: stable scene, no major risk flags.\n" + metrics_summary
+            prompt = base_prompt + "\n\nNo major risk flags detected.\n\n" + metrics_summary
         return (prompt,)
 
 
@@ -378,6 +394,7 @@ class SceneSelectorKling:
                 "w4_flatness": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "w5_lighting": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "w6_texture": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "occlusion_percentile": ("FLOAT", {"default": 85.0, "min": 50.0, "max": 99.0, "step": 1.0}),
             }
         }
 
@@ -722,6 +739,7 @@ class SceneSelectorKling:
         yolo_conf: float,
         yolo_imgsz: int,
         weights,
+        occlusion_percentile: float = 85.0,
         sam2_model=None,
         sam2_prompt: str = "floor",
         sam2_min_mask_ratio: float = 0.01,
@@ -753,7 +771,7 @@ class SceneSelectorKling:
 
         camera_metric = CameraMotionMetric()
         texture_metric = TextureStabilityMetric()
-        occlusion_metric = OcclusionRiskMetric()
+        occlusion_metric = OcclusionRiskMetric(occlusion_percentile=float(occlusion_percentile))
         flatness_metric = DepthVarianceMetric()
         lighting_metric = LightingStabilityMetric()
         plane_tracks = []
@@ -995,6 +1013,7 @@ class SceneSelectorKling:
         w4_flatness,
         w5_lighting,
         w6_texture,
+        occlusion_percentile,
     ):
         if not isinstance(images, torch.Tensor) or images.ndim != 4:
             raise ValueError("images must be IMAGE tensor [B,H,W,C]")
@@ -1086,6 +1105,7 @@ class SceneSelectorKling:
                 yolo_conf=float(yolo_conf),
                 yolo_imgsz=int(yolo_imgsz),
                 weights=weights,
+                occlusion_percentile=float(occlusion_percentile),
             )
             score = float(score_meta.get("score", 0.0))
             scene_scores.append(
@@ -1197,6 +1217,7 @@ class SceneSelectorUpload(SceneSelectorKling):
                 "sample_fps": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 30.0, "step": 0.1}),
                 "max_frames": ("INT", {"default": 0, "min": 0, "max": 20000}),
                 "max_decode_frames_per_scene": ("INT", {"default": 0, "min": 0, "max": 20000}),
+                "camera_mavg_window": ("INT", {"default": 5, "min": 1, "max": 31}),
                 "invert_depth": ("BOOLEAN", {"default": False}),
                 "local_files_only": ("BOOLEAN", {"default": False}),
                 "cache_dir": ("STRING", {"default": ""}),
@@ -1206,6 +1227,7 @@ class SceneSelectorUpload(SceneSelectorKling):
                 "w4_flatness": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "w5_lighting": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "w6_texture": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "occlusion_percentile": ("FLOAT", {"default": 85.0, "min": 50.0, "max": 99.0, "step": 1.0}),
             },
             "optional": {
                 "video_path": ("STRING", {"default": ""}),
@@ -1337,6 +1359,7 @@ class SceneSelectorUpload(SceneSelectorKling):
         sample_fps,
         max_frames,
         max_decode_frames_per_scene,
+        camera_mavg_window,
         invert_depth,
         local_files_only,
         cache_dir,
@@ -1346,6 +1369,7 @@ class SceneSelectorUpload(SceneSelectorKling):
         w4_flatness,
         w5_lighting,
         w6_texture,
+        occlusion_percentile,
         video_path="",
     ):
         chosen = str(video_path).strip() if isinstance(video_path, str) else ""
@@ -1361,7 +1385,10 @@ class SceneSelectorUpload(SceneSelectorKling):
         fps, total_frames = self._video_meta(resolved)
         fps_estimate = int(round(fps))
 
-        scenes, _ = detect_scenes(str(resolved))
+        scenes, _ = detect_scenes(
+            str(resolved),
+            camera_mavg_window=int(camera_mavg_window),
+        )
         used_single_scene_fallback = False
         if not scenes:
             used_single_scene_fallback = True
@@ -1421,6 +1448,7 @@ class SceneSelectorUpload(SceneSelectorKling):
                 yolo_conf=float(yolo_conf),
                 yolo_imgsz=int(yolo_imgsz),
                 weights=weights,
+                occlusion_percentile=float(occlusion_percentile),
             )
             score = float(score_meta.get("score", 0.0))
             scene_scores.append(
@@ -1495,6 +1523,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
                 "sample_fps": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 30.0, "step": 0.1}),
                 "max_frames": ("INT", {"default": 0, "min": 0, "max": 20000}),
                 "max_decode_frames_per_scene": ("INT", {"default": 0, "min": 0, "max": 20000}),
+                "camera_mavg_window": ("INT", {"default": 5, "min": 1, "max": 31}),
                 "invert_depth": ("BOOLEAN", {"default": False}),
                 "local_files_only": ("BOOLEAN", {"default": False}),
                 "cache_dir": ("STRING", {"default": ""}),
@@ -1504,6 +1533,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
                 "w4_flatness": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "w5_lighting": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "w6_texture": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "occlusion_percentile": ("FLOAT", {"default": 85.0, "min": 50.0, "max": 99.0, "step": 1.0}),
             },
             "optional": {
                 "video_path": ("STRING", {"default": ""}),
@@ -1530,6 +1560,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
         sample_fps,
         max_frames,
         max_decode_frames_per_scene,
+        camera_mavg_window,
         invert_depth,
         local_files_only,
         cache_dir,
@@ -1539,6 +1570,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
         w4_flatness,
         w5_lighting,
         w6_texture,
+        occlusion_percentile,
         video_path="",
     ):
         chosen = str(video_path).strip() if isinstance(video_path, str) else ""
@@ -1554,7 +1586,10 @@ class SceneSelectorSAM(SceneSelectorUpload):
         fps, total_frames = self._video_meta(resolved)
         fps_estimate = int(round(fps))
 
-        scenes, _ = detect_scenes(str(resolved))
+        scenes, _ = detect_scenes(
+            str(resolved),
+            camera_mavg_window=int(camera_mavg_window),
+        )
         used_single_scene_fallback = False
         if not scenes:
             used_single_scene_fallback = True
@@ -1614,6 +1649,7 @@ class SceneSelectorSAM(SceneSelectorUpload):
                 yolo_conf=float(yolo_conf),
                 yolo_imgsz=int(yolo_imgsz),
                 weights=weights,
+                occlusion_percentile=float(occlusion_percentile),
                 sam2_model=sam2_model,
                 sam2_prompt=str(sam2_prompt),
                 sam2_min_mask_ratio=float(sam2_min_mask_ratio),

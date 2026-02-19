@@ -81,8 +81,9 @@ class TextureStabilityMetric(BaseMetric):
 
 
 class OcclusionRiskMetric(BaseMetric):
-    def __init__(self) -> None:
+    def __init__(self, occlusion_percentile: float = 85.0) -> None:
         self.overlap_ratios: List[float] = []
+        self.occlusion_percentile = float(np.clip(float(occlusion_percentile), 50.0, 99.0))
 
     def update(self, ctx: FrameContext) -> None:
         floor = ctx.floor_mask
@@ -108,13 +109,17 @@ class OcclusionRiskMetric(BaseMetric):
             return {
                 "dynamic_object_overlap_ratio": 1.0,
                 "occlusion_score": 0.0,
+                "occlusion_percentile": float(self.occlusion_percentile),
             }
 
-        overlap_ratio = float(np.percentile(np.asarray(self.overlap_ratios, dtype=np.float32), 85))
+        overlap_ratio = float(
+            np.percentile(np.asarray(self.overlap_ratios, dtype=np.float32), float(self.occlusion_percentile))
+        )
         occlusion_score = float(np.clip(1.0 - overlap_ratio, 0.0, 1.0))
         return {
             "dynamic_object_overlap_ratio": overlap_ratio,
             "occlusion_score": occlusion_score,
+            "occlusion_percentile": float(self.occlusion_percentile),
         }
 
 

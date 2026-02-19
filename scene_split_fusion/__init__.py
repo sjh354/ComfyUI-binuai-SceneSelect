@@ -211,6 +211,7 @@ def detect_scenes(
     camera_threshold: float = 0.70,
     camera_max_width: int = 640,
     camera_min_matches: int = 60,
+    camera_mavg_window: int = 5,
     merge_window_sec: float = 0.30,
     weights: Optional[Dict[str, float]] = None,
     print_cut_reasons: bool = True,
@@ -258,7 +259,8 @@ def detect_scenes(
             fps=fps,
             threshold=camera_threshold,
             max_width=camera_max_width,
-            min_matches=camera_min_matches
+            min_matches=camera_min_matches,
+            score_smoothing_window=int(camera_mavg_window),
         )
     except Exception:
         b_cam = []

@@ -23,7 +23,8 @@ def run_camera_jump(
     fps: float,
     threshold: float = 0.70,
     max_width: int = 640,
-    min_matches: int = 60
+    min_matches: int = 60,
+    score_smoothing_window: int = 5,
 ) -> List[Boundary]:
     """
     ORB + Homography 기반 카메라 점프 탐지.
@@ -106,7 +107,7 @@ def run_camera_jump(
 
     # Suppress single-frame spikes by requiring neighborhood support
     # around a candidate (or a very strong raw peak).
-    p = _moving_average_1d(p_raw, window=5)
+    p = _moving_average_1d(p_raw, window=int(max(1, score_smoothing_window)))
     idx = np.where(p >= threshold)[0]
     boundaries: List[Boundary] = []
     if len(idx) == 0:
