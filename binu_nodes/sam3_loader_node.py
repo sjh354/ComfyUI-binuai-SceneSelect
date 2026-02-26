@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from infra.comfy_paths import sam3_model_dir
-from infra.model_hub import build_sam3_payload, download_sam3_checkpoint
+from binu_infra.comfy_paths import sam3_model_dir
+from binu_infra.model_hub import build_sam3_payload, download_sam3_checkpoint
 
 
 class SAM3ModelLoader:

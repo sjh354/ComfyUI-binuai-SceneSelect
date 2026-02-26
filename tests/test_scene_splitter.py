@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from domain.scene_split.splitter import split_from_video
+from binu_domain.scene_split.splitter import split_from_video
 
 
 def test_split_from_video_wraps_segments():

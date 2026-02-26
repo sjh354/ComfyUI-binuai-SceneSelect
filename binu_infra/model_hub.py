@@ -4,7 +4,7 @@ import urllib.request
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 
-from domain.constants import SAM3_CHECKPOINT_URL, SAM3_HF_REPO_CANDIDATES, SAM3_URL_CANDIDATES
+from binu_domain.constants import SAM3_CHECKPOINT_URL, SAM3_HF_REPO_CANDIDATES, SAM3_URL_CANDIDATES
 
 
 class SAM3ModelWrapper:

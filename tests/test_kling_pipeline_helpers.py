@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from domain.kling_analysis.pipeline import compact_score_meta, normalize_choice
+from binu_domain.kling_analysis.pipeline import compact_score_meta, normalize_choice
 
 
 def test_normalize_choice_uses_value_when_valid():

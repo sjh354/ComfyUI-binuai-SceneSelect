@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from domain.scene_types import SceneSegment
+from binu_domain.scene_types import SceneSegment
 
 
 def split_from_video(video_path: Path, fps: float, total_frames: int, camera_mavg_window: int) -> tuple[list[SceneSegment], bool]:

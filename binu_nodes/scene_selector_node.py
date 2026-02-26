@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from domain.constants import DEPTH_MODEL_PRESETS, YOLO_MODEL_PRESETS
-from domain.scene_selection import select_best_scene_from_video
-from infra.comfy_paths import resolve_video_path, video_candidates
+from binu_domain.constants import DEPTH_MODEL_PRESETS, YOLO_MODEL_PRESETS
+from binu_domain.scene_selection import select_best_scene_from_video
+from binu_infra.comfy_paths import resolve_video_path, video_candidates
 
 
 class _SceneSelectorBase:

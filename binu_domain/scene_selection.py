@@ -4,11 +4,11 @@ from pathlib import Path
 
 import torch
 
-from domain.kling_analysis.pipeline import analyze_scene_chunk, compact_score_meta, normalize_choice
-from domain.scene_split.splitter import split_from_video
-from domain.scene_types import AnalysisSummary, SelectedScene, to_analysis_json
-from infra.ffmpeg_io import read_audio_segment
-from infra.video_io import get_video_meta, read_scene_tensor
+from binu_domain.kling_analysis.pipeline import analyze_scene_chunk, compact_score_meta, normalize_choice
+from binu_domain.scene_split.splitter import split_from_video
+from binu_domain.scene_types import AnalysisSummary, SelectedScene, to_analysis_json
+from binu_infra.ffmpeg_io import read_audio_segment
+from binu_infra.video_io import get_video_meta, read_scene_tensor
 
 
 def select_best_scene_from_video(

@@ -12,9 +12,9 @@ def _ensure_local_pkg_on_path() -> None:
 
 _ensure_local_pkg_on_path()
 
-from nodes.prompt_node import KlingPromptFromAnalysis
-from nodes.sam3_loader_node import SAM3ModelLoader
-from nodes.scene_selector_node import SceneSelectorSAM, SceneSelectorUpload
+from binu_nodes.prompt_node import KlingPromptFromAnalysis
+from binu_nodes.sam3_loader_node import SAM3ModelLoader
+from binu_nodes.scene_selector_node import SceneSelectorSAM, SceneSelectorUpload
 
 NODE_CLASS_MAPPINGS = {
     "SAM3ModelLoader": SAM3ModelLoader,
