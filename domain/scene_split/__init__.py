@@ -1,0 +1,1 @@
+"""Scene splitting domain package."""
